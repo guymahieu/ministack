@@ -2128,3 +2128,328 @@ def test_kms_primary_with_replicas_waits_on_deletion():
 
     west.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
     assert east.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "PendingDeletion"
+
+
+# ── Seed file unit tests (no server required) ──────────────────────────────
+
+
+def _make_seed(tmp_path, content):
+    """Write *content* (str) to a temporary seed.yaml and return the path."""
+    p = tmp_path / "seed.yaml"
+    p.write_text(content)
+    return str(p)
+
+
+def _rsa_pem():
+    """Generate a minimal 2048-bit RSA private key in PKCS#8 PEM format."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+
+
+def _with_fresh_kms(fn):
+    """Run *fn* with a clean KMS state, restore afterwards."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import kms as _kms
+
+    account = get_account_id()
+    region = get_region()
+    _kms.reset()
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    try:
+        fn(_kms)
+    finally:
+        _kms.reset()
+        set_request_account_id(account)
+        set_request_region(region)
+
+
+def test_kms_seed_loads_aes_key(tmp_path):
+    """A symmetric AES key is loaded with correct spec and backing material."""
+    key_id = "aaaaaaaa-0000-0000-0000-000000000001"
+    # Use a non-zero hex value so YAML does not parse it as integer 0.
+    hex_key = "aa" * 32
+    seed = f"""
+Keys:
+  Symmetric:
+    Aes:
+      - Metadata:
+          KeyId: {key_id}
+        BackingKeys:
+          - {hex_key}
+"""
+
+    def check(kms):
+        kms.load_seed_file(_make_seed(tmp_path, seed))
+        rec = kms._resolve_key(key_id)
+        assert rec is not None
+        assert rec["KeySpec"] == "SYMMETRIC_DEFAULT"
+        assert rec["KeyUsage"] == "ENCRYPT_DECRYPT"
+        assert rec["KeyState"] == "Enabled"
+        assert rec["_symmetric_key"] == bytes.fromhex(hex_key)
+
+    _with_fresh_kms(check)
+
+
+def test_kms_seed_loads_rsa_key(tmp_path):
+    """An RSA signing key is loaded with correct spec and usable private key."""
+    pytest.importorskip("cryptography")
+    key_id = "bbbbbbbb-0000-0000-0000-000000000002"
+    pem = _rsa_pem()
+    indented = "\n".join("          " + line for line in pem.splitlines())
+    seed = f"""
+Keys:
+  Asymmetric:
+    Rsa:
+      - Metadata:
+          KeyId: {key_id}
+          KeyUsage: SIGN_VERIFY
+          Description: test RSA key
+        PrivateKeyPem: |
+{indented}
+"""
+
+    def check(kms):
+        kms.load_seed_file(_make_seed(tmp_path, seed))
+        rec = kms._resolve_key(key_id)
+        assert rec is not None
+        assert rec["KeySpec"] == "RSA_2048"
+        assert rec["KeyUsage"] == "SIGN_VERIFY"
+        assert rec["Description"] == "test RSA key"
+        assert "RSASSA_PKCS1_V1_5_SHA_256" in rec["SigningAlgorithms"]
+        assert rec["EncryptionAlgorithms"] == []
+        assert "_private_key" in rec
+        assert "_public_key_der" in rec
+
+    _with_fresh_kms(check)
+
+
+def test_kms_seed_loads_aliases(tmp_path):
+    """Aliases defined in the seed file resolve to the correct key IDs."""
+    key_id = "cccccccc-0000-0000-0000-000000000003"
+    hex_key = "ff" * 32
+    seed = f"""
+Keys:
+  Symmetric:
+    Aes:
+      - Metadata:
+          KeyId: {key_id}
+        BackingKeys:
+          - {hex_key}
+Aliases:
+  - AliasName: alias/my-seed-key
+    TargetKeyId: {key_id}
+"""
+
+    def check(kms):
+        kms.load_seed_file(_make_seed(tmp_path, seed))
+        rec = kms._resolve_key("alias/my-seed-key")
+        assert rec is not None
+        assert rec["KeyId"] == key_id
+
+    _with_fresh_kms(check)
+
+
+def test_kms_seed_does_not_overwrite_existing_key(tmp_path):
+    """A key that already exists in the store is not replaced by the seed."""
+    key_id = "dddddddd-0000-0000-0000-000000000004"
+    original_bytes = bytes(range(32))
+    seed_bytes = "ff" * 32
+    seed = f"""
+Keys:
+  Symmetric:
+    Aes:
+      - Metadata:
+          KeyId: {key_id}
+        BackingKeys:
+          - {seed_bytes}
+"""
+
+    def check(kms):
+        existing = {
+            "KeyId": key_id,
+            "Arn": f"arn:aws:kms:us-east-1:000000000000:key/{key_id}",
+            "KeyState": "Enabled",
+            "Enabled": True,
+            "KeySpec": "SYMMETRIC_DEFAULT",
+            "KeyUsage": "ENCRYPT_DECRYPT",
+            "Description": "pre-existing",
+            "CreationDate": 0,
+            "Origin": "AWS_KMS",
+            "_symmetric_key": original_bytes,
+            "EncryptionAlgorithms": ["SYMMETRIC_DEFAULT"],
+            "SigningAlgorithms": [],
+            "MultiRegion": False,
+        }
+        kms._keys[key_id] = existing
+        kms.load_seed_file(_make_seed(tmp_path, seed))
+        assert kms._keys[key_id]["_symmetric_key"] == original_bytes
+
+    _with_fresh_kms(check)
+
+
+def test_kms_seed_seeded_aes_key_encrypts_and_decrypts(tmp_path):
+    """A key loaded from seed can be used for encrypt/decrypt round-trips."""
+    pytest.importorskip("cryptography")
+    key_id = "eeeeeeee-0000-0000-0000-000000000005"
+    hex_key = "ab" * 32
+    seed = f"""
+Keys:
+  Symmetric:
+    Aes:
+      - Metadata:
+          KeyId: {key_id}
+        BackingKeys:
+          - {hex_key}
+"""
+    import asyncio
+
+    def check(kms):
+        kms.load_seed_file(_make_seed(tmp_path, seed))
+        plaintext = b"hello from seed"
+
+        enc_req = json.dumps({
+            "KeyId": key_id,
+            "Plaintext": base64.b64encode(plaintext).decode(),
+        }).encode()
+        status, _, body = asyncio.run(kms.handle_request(
+            "POST", "/kms", {"x-amz-target": "TrentService.Encrypt"}, enc_req, {}
+        ))
+        assert status == 200
+        ct = json.loads(body)["CiphertextBlob"]
+
+        dec_req = json.dumps({"CiphertextBlob": ct}).encode()
+        status, _, body = asyncio.run(kms.handle_request(
+            "POST", "/kms", {"x-amz-target": "TrentService.Decrypt"}, dec_req, {}
+        ))
+        assert status == 200
+        assert base64.b64decode(json.loads(body)["Plaintext"]) == plaintext
+
+    _with_fresh_kms(check)
+
+
+def test_kms_seed_seeded_rsa_key_signs_and_verifies(tmp_path):
+    """A key loaded from seed can be used for sign/verify operations."""
+    pytest.importorskip("cryptography")
+    key_id = "ffffffff-0000-0000-0000-000000000006"
+    pem = _rsa_pem()
+    indented = "\n".join("          " + line for line in pem.splitlines())
+    seed = f"""
+Keys:
+  Asymmetric:
+    Rsa:
+      - Metadata:
+          KeyId: {key_id}
+          KeyUsage: SIGN_VERIFY
+        PrivateKeyPem: |
+{indented}
+"""
+    import asyncio
+
+    def check(kms):
+        kms.load_seed_file(_make_seed(tmp_path, seed))
+        message = base64.b64encode(b"test message").decode()
+
+        sign_req = json.dumps({
+            "KeyId": key_id,
+            "Message": message,
+            "SigningAlgorithm": "RSASSA_PKCS1_V1_5_SHA_256",
+        }).encode()
+        status, _, body = asyncio.run(kms.handle_request(
+            "POST", "/kms", {"x-amz-target": "TrentService.Sign"}, sign_req, {}
+        ))
+        assert status == 200
+        sig = json.loads(body)["Signature"]
+
+        verify_req = json.dumps({
+            "KeyId": key_id,
+            "Message": message,
+            "Signature": sig,
+            "SigningAlgorithm": "RSASSA_PKCS1_V1_5_SHA_256",
+        }).encode()
+        status, _, body = asyncio.run(kms.handle_request(
+            "POST", "/kms", {"x-amz-target": "TrentService.Verify"}, verify_req, {}
+        ))
+        assert status == 200
+        assert json.loads(body)["SignatureValid"] is True
+
+    _with_fresh_kms(check)
+
+
+def test_kms_seed_missing_file_does_not_raise(tmp_path):
+    """load_seed_file logs an error but does not raise when the file is absent."""
+    def check(kms):
+        kms.load_seed_file(str(tmp_path / "nonexistent.yaml"))
+        assert len(list(kms._keys.values())) == 0
+
+    _with_fresh_kms(check)
+
+
+def test_kms_seed_invalid_yaml_does_not_raise(tmp_path):
+    """load_seed_file logs an error but does not raise on malformed YAML."""
+    bad_seed = _make_seed(tmp_path, ":\nnot: [valid yaml: {")
+
+    def check(kms):
+        kms.load_seed_file(bad_seed)
+        assert len(list(kms._keys.values())) == 0
+
+    _with_fresh_kms(check)
+
+
+def test_kms_seed_invalid_hex_backing_key_is_skipped(tmp_path):
+    """An AES entry with non-hex backing key material is skipped gracefully."""
+    seed = """
+Keys:
+  Symmetric:
+    Aes:
+      - Metadata:
+          KeyId: 11111111-0000-0000-0000-000000000007
+        BackingKeys:
+          - not-valid-hex
+"""
+
+    def check(kms):
+        kms.load_seed_file(_make_seed(tmp_path, seed))
+        assert kms._resolve_key("11111111-0000-0000-0000-000000000007") is None
+
+    _with_fresh_kms(check)
+
+
+def test_kms_seed_alias_without_matching_key_is_stored(tmp_path):
+    """An alias entry whose target key is not in the seed is still stored."""
+    key_id = "22222222-0000-0000-0000-000000000008"
+    hex_key = "cd" * 32
+    seed = f"""
+Keys:
+  Symmetric:
+    Aes:
+      - Metadata:
+          KeyId: {key_id}
+        BackingKeys:
+          - {hex_key}
+Aliases:
+  - AliasName: alias/orphan-alias
+    TargetKeyId: 99999999-0000-0000-0000-000000000000
+  - AliasName: alias/valid-alias
+    TargetKeyId: {key_id}
+"""
+
+    def check(kms):
+        kms.load_seed_file(_make_seed(tmp_path, seed))
+        # The valid alias resolves; the orphan alias is stored but resolves to None
+        assert kms._resolve_key("alias/valid-alias") is not None
+        assert kms._resolve_key("alias/orphan-alias") is None
+
+    _with_fresh_kms(check)
