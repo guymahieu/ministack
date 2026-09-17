@@ -2584,6 +2584,7 @@ async def _handle_lifespan(scope, receive, send):
                 )
             if PERSIST_STATE:
                 _load_persisted_state()
+            _load_kms_seed()
             # Start the Transfer Family SFTP listener after persistence is
             # loaded (so any restored Transfer servers/users are visible to
             # the SSH auth callback). When the user opts out via
@@ -2754,6 +2755,19 @@ def _load_persisted_state():
                     "Failed to restore persisted state for %s; continuing fresh",
                     state_key,
                 )
+
+
+def _load_kms_seed():
+    """Load initial KMS key material from KMS_SEED_FILE if set."""
+    seed_path = os.environ.get("KMS_SEED_FILE", "").strip()
+    if not seed_path:
+        return
+    try:
+        kms_mod = _get_module("kms")
+        kms_mod.load_seed_file(seed_path)
+        logger.info("Loaded KMS seed file: %s", seed_path)
+    except Exception:
+        logger.exception("Failed to load KMS seed file %s", seed_path)
 
 
 async def _wait_for_port(port, timeout=30):

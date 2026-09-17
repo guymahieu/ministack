@@ -1760,6 +1760,214 @@ async def handle_request(method, path, headers, body, query_params):
     return handler(data)
 
 
+def load_seed_file(path):
+    """Load initial KMS key material from a YAML seed file.
+
+    Supports the LocalStack-compatible seed format:
+      Keys:
+        Symmetric:
+          Aes:
+            - Metadata: {KeyId: ...}
+              BackingKeys: ["<hex>"]
+        Asymmetric:
+          Rsa:
+            - Metadata: {KeyId: ..., KeyUsage: ..., Description: ...}
+              PrivateKeyPem: |
+                -----BEGIN PRIVATE KEY-----
+                ...
+      Aliases:
+        - AliasName: alias/...
+          TargetKeyId: ...
+
+    Existing keys are not overwritten. Requires PyYAML (pip install pyyaml).
+    """
+    try:
+        import yaml
+    except ImportError:
+        logger.error(
+            "KMS seed file requires PyYAML. Install with: pip install pyyaml"
+        )
+        return
+
+    try:
+        with open(path, "r") as f:
+            seed = yaml.safe_load(f)
+    except OSError as e:
+        logger.error("Cannot open KMS seed file %s: %s", path, e)
+        return
+    except Exception as e:
+        logger.error("Cannot parse KMS seed file %s: %s", path, e)
+        return
+
+    if not seed:
+        return
+
+    keys_section = seed.get("Keys", {}) or {}
+
+    # Symmetric AES keys
+    for entry in (keys_section.get("Symmetric") or {}).get("Aes") or []:
+        meta = entry.get("Metadata") or {}
+        key_id = meta.get("KeyId")
+        if not key_id:
+            logger.warning("KMS seed: skipping AES entry with no KeyId")
+            continue
+        if key_id in _keys:
+            logger.debug("KMS seed: key %s already exists, skipping", key_id)
+            continue
+        backing = (entry.get("BackingKeys") or [None])[0]
+        if backing is None:
+            logger.warning("KMS seed: AES key %s has no BackingKeys, skipping", key_id)
+            continue
+        if not isinstance(backing, str):
+            logger.warning(
+                "KMS seed: AES key %s BackingKeys value must be a quoted string in YAML, skipping",
+                key_id,
+            )
+            continue
+        try:
+            key_bytes = bytes.fromhex(backing)
+        except ValueError:
+            logger.warning("KMS seed: AES key %s has invalid hex material, skipping", key_id)
+            continue
+        if len(key_bytes) != 32:
+            logger.warning(
+                "KMS seed: AES key %s has wrong material length %d bytes (expected 32), skipping",
+                key_id, len(key_bytes),
+            )
+            continue
+        rec = {
+            "KeyId": key_id,
+            "Arn": _arn(key_id),
+            "KeyState": "Enabled",
+            "Enabled": True,
+            "KeySpec": "SYMMETRIC_DEFAULT",
+            "KeyUsage": "ENCRYPT_DECRYPT",
+            "Description": meta.get("Description", ""),
+            "CreationDate": int(time.time()),
+            "Origin": "AWS_KMS",
+            "Tags": [],
+            "MultiRegion": False,
+            "Policy": json.dumps({
+                "Version": "2012-10-17",
+                "Id": "key-default-1",
+                "Statement": [{
+                    "Sid": "Enable IAM User Permissions",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": f"arn:aws:iam::{get_account_id()}:root"},
+                    "Action": "kms:*",
+                    "Resource": "*",
+                }],
+            }),
+            "_symmetric_key": key_bytes,
+            "EncryptionAlgorithms": ["SYMMETRIC_DEFAULT"],
+            "SigningAlgorithms": [],
+        }
+        _keys[key_id] = rec
+        logger.info("KMS seed: loaded AES key %s", key_id)
+
+    # Asymmetric RSA keys
+    for entry in (keys_section.get("Asymmetric") or {}).get("Rsa") or []:
+        meta = entry.get("Metadata") or {}
+        key_id = meta.get("KeyId")
+        if not key_id:
+            logger.warning("KMS seed: skipping RSA entry with no KeyId")
+            continue
+        if key_id in _keys:
+            logger.debug("KMS seed: key %s already exists, skipping", key_id)
+            continue
+        pem_str = entry.get("PrivateKeyPem")
+        if not pem_str:
+            logger.warning("KMS seed: RSA key %s has no PrivateKeyPem, skipping", key_id)
+            continue
+        if not HAS_CRYPTO:
+            logger.warning(
+                "KMS seed: cryptography package not installed; cannot load RSA key %s",
+                key_id,
+            )
+            continue
+        try:
+            private_key = serialization.load_pem_private_key(
+                pem_str.encode() if isinstance(pem_str, str) else pem_str,
+                password=None,
+            )
+        except Exception as e:
+            logger.warning("KMS seed: failed to load RSA key %s: %s", key_id, e)
+            continue
+        key_size = private_key.key_size
+        if key_size not in (2048, 3072, 4096):
+            logger.warning("KMS seed: RSA key %s has unsupported size %d, skipping", key_id, key_size)
+            continue
+        key_spec = f"RSA_{key_size}"
+        key_usage = meta.get("KeyUsage", "SIGN_VERIFY")
+        public_key_der = private_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        if key_usage == "SIGN_VERIFY":
+            signing_algos = [
+                "RSASSA_PKCS1_V1_5_SHA_256",
+                "RSASSA_PKCS1_V1_5_SHA_384",
+                "RSASSA_PKCS1_V1_5_SHA_512",
+                "RSASSA_PSS_SHA_256",
+                "RSASSA_PSS_SHA_384",
+                "RSASSA_PSS_SHA_512",
+            ]
+            enc_algos = []
+        else:
+            signing_algos = []
+            enc_algos = ["RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256"]
+        rec = {
+            "KeyId": key_id,
+            "Arn": _arn(key_id),
+            "KeyState": "Enabled",
+            "Enabled": True,
+            "KeySpec": key_spec,
+            "KeyUsage": key_usage,
+            "Description": meta.get("Description", ""),
+            "CreationDate": int(time.time()),
+            "Origin": "AWS_KMS",
+            "Tags": [],
+            "MultiRegion": False,
+            "Policy": json.dumps({
+                "Version": "2012-10-17",
+                "Id": "key-default-1",
+                "Statement": [{
+                    "Sid": "Enable IAM User Permissions",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": f"arn:aws:iam::{get_account_id()}:root"},
+                    "Action": "kms:*",
+                    "Resource": "*",
+                }],
+            }),
+            "_private_key": private_key,
+            "_public_key_der": public_key_der,
+            "SigningAlgorithms": signing_algos,
+            "EncryptionAlgorithms": enc_algos,
+        }
+        _keys[key_id] = rec
+        logger.info("KMS seed: loaded RSA key %s (%s, %s)", key_id, key_spec, key_usage)
+
+    # Aliases
+    for alias_entry in seed.get("Aliases") or []:
+        alias_name = alias_entry.get("AliasName", "")
+        target_key_id = alias_entry.get("TargetKeyId", "")
+        if not alias_name or not target_key_id:
+            logger.warning("KMS seed: skipping alias entry with missing AliasName or TargetKeyId")
+            continue
+        rec = _keys.get(target_key_id)
+        if not rec:
+            logger.warning(
+                "KMS seed: alias %s references unknown key %s (stored but will not resolve until key is present)",
+                alias_name, target_key_id,
+            )
+        alias_arn = _alias_arn_from_key_record(alias_name, rec)
+        if alias_arn in _aliases:
+            logger.debug("KMS seed: alias %s already exists, skipping", alias_name)
+            continue
+        _aliases[alias_arn] = target_key_id
+        logger.info("KMS seed: loaded alias %s -> %s", alias_name, target_key_id)
+
+
 def reset():
     _keys.clear()
     _aliases.clear()
