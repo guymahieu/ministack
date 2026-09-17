@@ -348,7 +348,6 @@ def _create_key(data):
     # A multi-Region key's id carries the mrk- prefix, and the id is what ties
     # the primary and its replicas together across regions.
     multi_region = bool(data.get("MultiRegion", False))
-    key_id = f"mrk-{new_uuid().replace('-', '')}" if multi_region else new_uuid()
     key_spec = data.get("KeySpec", data.get("CustomerMasterKeySpec", "SYMMETRIC_DEFAULT"))
     key_usage = data.get("KeyUsage", "ENCRYPT_DECRYPT")
     if key_spec in _HMAC_KEY_SPECS and key_usage != MAC_KEY_USAGE:
@@ -367,7 +366,40 @@ def _create_key(data):
             400,
         )
     description = data.get("Description", "")
-    tags = data.get("Tags", [])
+
+    # Extract LocalStack-compatible special tags before storing the rest.
+    # _custom_id_: use this value as the key ID instead of generating one.
+    # _custom_key_material_: hex (symmetric/HMAC) or base64-PEM (asymmetric)
+    #   key material to use instead of generating random material.
+    custom_id = None
+    custom_material = None
+    tags = []
+    for tag in data.get("Tags", []):
+        k = tag.get("TagKey", "")
+        if k == "_custom_id_":
+            custom_id = tag.get("TagValue", "").strip()
+        elif k == "_custom_key_material_":
+            custom_material = tag.get("TagValue", "").strip()
+        else:
+            tags.append(tag)
+
+    if custom_id:
+        if multi_region and not custom_id.startswith("mrk-"):
+            return error_response_json(
+                "ValidationException",
+                "A multi-Region key's _custom_id_ must start with 'mrk-'",
+                400,
+            )
+        key_id = custom_id
+        if key_id in _keys:
+            return error_response_json(
+                "AlreadyExistsException", f"Key {key_id} already exists", 400
+            )
+    elif multi_region:
+        key_id = f"mrk-{new_uuid().replace('-', '')}"
+    else:
+        key_id = new_uuid()
+
     policy = data.get("Policy", json.dumps({
         "Version": "2012-10-17",
         "Id": "key-default-1",
@@ -404,20 +436,72 @@ def _create_key(data):
         rec["_mrk_regions"] = [get_region()]
 
     if key_spec == "SYMMETRIC_DEFAULT":
-        rec["_symmetric_key"] = os.urandom(32)
+        if custom_material:
+            try:
+                key_bytes = bytes.fromhex(custom_material)
+            except ValueError:
+                return error_response_json(
+                    "ValidationException",
+                    "_custom_key_material_ for a symmetric key must be hex-encoded",
+                    400,
+                )
+            if len(key_bytes) != 32:
+                return error_response_json(
+                    "ValidationException",
+                    f"_custom_key_material_ must be 32 bytes for SYMMETRIC_DEFAULT, got {len(key_bytes)}",
+                    400,
+                )
+            rec["_symmetric_key"] = key_bytes
+        else:
+            rec["_symmetric_key"] = os.urandom(32)
         rec["EncryptionAlgorithms"] = ["SYMMETRIC_DEFAULT"]
         rec["SigningAlgorithms"] = []
     elif key_spec in _HMAC_KEY_SPECS:
         mac_algorithm, material_len = _HMAC_KEY_SPECS[key_spec]
-        rec["_hmac_key"] = os.urandom(material_len)
+        if custom_material:
+            try:
+                hmac_bytes = bytes.fromhex(custom_material)
+            except ValueError:
+                return error_response_json(
+                    "ValidationException",
+                    "_custom_key_material_ for an HMAC key must be hex-encoded",
+                    400,
+                )
+            if len(hmac_bytes) != material_len:
+                return error_response_json(
+                    "ValidationException",
+                    f"_custom_key_material_ must be {material_len} bytes for {key_spec}, got {len(hmac_bytes)}",
+                    400,
+                )
+            rec["_hmac_key"] = hmac_bytes
+        else:
+            rec["_hmac_key"] = os.urandom(material_len)
         rec["MacAlgorithms"] = [mac_algorithm]
     elif key_spec in ("RSA_2048", "RSA_3072", "RSA_4096"):
         err = _require_crypto("CreateKey")
         if err:
             return err
-        private_key = rsa.generate_private_key(
-            public_exponent=65537, key_size=int(key_spec.split("_")[1])
-        )
+        if custom_material:
+            try:
+                pem_bytes = base64.b64decode(custom_material)
+                private_key = serialization.load_pem_private_key(pem_bytes, password=None)
+            except Exception as e:
+                return error_response_json(
+                    "ValidationException",
+                    f"_custom_key_material_ for an RSA key must be base64-encoded PEM: {e}",
+                    400,
+                )
+            expected_bits = int(key_spec.split("_")[1])
+            if not isinstance(private_key, rsa.RSAPrivateKey) or private_key.key_size != expected_bits:
+                return error_response_json(
+                    "ValidationException",
+                    f"_custom_key_material_ key size does not match {key_spec}",
+                    400,
+                )
+        else:
+            private_key = rsa.generate_private_key(
+                public_exponent=65537, key_size=int(key_spec.split("_")[1])
+            )
         rec["_private_key"] = private_key
         rec["_public_key_der"] = private_key.public_key().public_bytes(
             serialization.Encoding.DER,
@@ -449,7 +533,28 @@ def _create_key(data):
             "ECC_NIST_P521": ec.SECP521R1(),
             "ECC_SECG_P256K1": ec.SECP256K1(),
         }
-        private_key = ec.generate_private_key(curve_map[key_spec])
+        if custom_material:
+            try:
+                pem_bytes = base64.b64decode(custom_material)
+                private_key = serialization.load_pem_private_key(pem_bytes, password=None)
+            except Exception as e:
+                return error_response_json(
+                    "ValidationException",
+                    f"_custom_key_material_ for an ECC key must be base64-encoded PEM: {e}",
+                    400,
+                )
+            expected_curve = curve_map[key_spec]
+            if (
+                not isinstance(private_key, ec.EllipticCurvePrivateKey)
+                or type(private_key.curve) is not type(expected_curve)
+            ):
+                return error_response_json(
+                    "ValidationException",
+                    f"_custom_key_material_ curve does not match {key_spec}",
+                    400,
+                )
+        else:
+            private_key = ec.generate_private_key(curve_map[key_spec])
         rec["_private_key"] = private_key
         rec["_public_key_der"] = private_key.public_key().public_bytes(
             serialization.Encoding.DER,
@@ -467,7 +572,24 @@ def _create_key(data):
         err = _require_crypto("CreateKey")
         if err:
             return err
-        private_key = ed25519.Ed25519PrivateKey.generate()
+        if custom_material:
+            try:
+                pem_bytes = base64.b64decode(custom_material)
+                private_key = serialization.load_pem_private_key(pem_bytes, password=None)
+            except Exception as e:
+                return error_response_json(
+                    "ValidationException",
+                    f"_custom_key_material_ for an Ed25519 key must be base64-encoded PEM: {e}",
+                    400,
+                )
+            if not isinstance(private_key, ed25519.Ed25519PrivateKey):
+                return error_response_json(
+                    "ValidationException",
+                    "_custom_key_material_ is not an Ed25519 private key",
+                    400,
+                )
+        else:
+            private_key = ed25519.Ed25519PrivateKey.generate()
         rec["_private_key"] = private_key
         rec["_public_key_der"] = private_key.public_key().public_bytes(
             serialization.Encoding.DER,

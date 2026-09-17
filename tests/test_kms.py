@@ -2128,3 +2128,380 @@ def test_kms_primary_with_replicas_waits_on_deletion():
 
     west.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
     assert east.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "PendingDeletion"
+
+
+# ---- _custom_id_ / _custom_key_material_ tag feature ----
+
+# A known RSA-2048 private key used by several tests below so they share
+# a predictable public key without paying for key generation each time.
+_RSA_TEST_KEY_PEM = """\
+-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCfvXUZNfkrh8OL
+WS4GUgmqMkCnB3SLVpyWnm6IbyZVJb/5E2ZiKT0jrLa2AKMyShyCdZ8+98OS+4of
+3c4dHr+WXxq1nLjhm50tDLXgSqhAA6QHaS3t7SXAlKQF5ZhlnyfwyS8N8GY3hsqy
+3VpKITKj4vDeLguVbQGvKf18hTwt34+HUYJ27y+onCQrkR6fWZDQYHFfKzU/ETgF
+P/grgZwUYQamlp7DPC35/DuyqSl7Ik+EOp5oeEFNsPGWNsOUi97qclDlvvgkVQR9
+ghrCUR8++dOr7lJ1pmkmRljGoPAyYv2LCTvwlKYCuvb2FRyfRQI9QH83iF4TlfU6
+fWHn0buzAgMBAAECggEAdLjrp9BYkgZSTLCNgPDRPxwZQfOgpXBUW3rJKciOKgm7
+jTUvyup3UmoR2Ev+8/BThMCN7GT+85f6Be79fSnKtQYpbitmrPQYlaKEA7CJ4LzI
+TuH8Pa7btyzl7aknApqZhMh9KaJQDqLf2nMEVsaLSlW5y5+5tyY/5M65+xMgNiPN
+2C1dOeSoRZGoqWcwVkx9hpJRzkzojuVFZkgYmhhHNUAK6TSFJx+ycDHGdX8sbt2F
+4U8RrroxnzefwgKjmZYLDz4fqmyPL3FRAY97nhMLCyLNgxdABzbGQZufy1GqHt2F
+chWe6Qm+jQmbBPjWfcIDCOvsRqea/Jcxm6BJOJD1AQKBgQDTija0aNeM87iQeUfT
+6mV7gKx5e7hf4u51qdRzvnJuEU6bJLKiqNvK3XaXE+pClkc6K4HZzJwJMaimTkad
+b0lTCdOTil+zH21DDPslpECCKdXzl3hAkaPEtvn4piZ/JmnCbP7Mh+Po2s6VfI24
+G0s8xU5BQg5CbOMMMMAfu1a4yQKBgQDBUC7KbIK2EWHrIzDG/+WxemJ/BvOb/WB9
+sq1MTgGSsov2G1bzJTaYke+rFOwNkLlFw7JsLfj01JAgNNn3Sy9cuHS/tMYzKgYe
+DmsWvrPuxrfND2Op5A86q9h4jVqYIeoncmcP4DgYz5wbmhim2pM2kfQudrJLWyli
+DVJRAlgKmwKBgH1U/VZka5liaS6H/MuMq7XBpe6QI8wD2v6xsWMmKgwWivkWhBQl
+cZu/HN0j+n6bJPZNArE1LhmwZ1ipNeNfJRVi1A0tRcgNzaGVVlOV/nZgLRgW3TN8
+VohdVLtCTbq12qFMDKbHuHuk8BLXaevzl98Yk2XMqkAm3VrCo4Hpb9cpAoGBAI8d
+lLaKJS8zqUGSuP7q3ptJVvhiJiJ7MF9+06vlKGb5xoK6dOHn0AaeLEiFYckdNvz+
+R+6tDl37rIQbfK8HO5YyfUScSgwA9ax00jVxk/aXqeWnmgph7CBsrwN46vQsT5VK
+riBjyEQeF52btNp6gXhqD9QCTjdZ00ZjRGjzCkk3AoGBANE89mHI5aG/L+bAiFc8
+F/g96MfAXNgAxElRjTffcvAXKoLCZDEHbBbHm4J3ey/bbmQ5+Du5J6UfFUd7oQ+7
+6wAZuZgKiZ+SRwXgnhlm7A9ct7qvAQw262M3a3jOPxxhOIMXBIzDT9dZFG5EPel0
+Z/YThhaugr/s8LfEVBVEcivr
+-----END PRIVATE KEY-----
+"""
+
+
+def test_kms_custom_id_symmetric(kms_client):
+    custom_id = str(_uuid_mod.uuid4())
+    resp = kms_client.create_key(
+        Tags=[{"TagKey": "_custom_id_", "TagValue": custom_id}]
+    )
+    meta = resp["KeyMetadata"]
+    assert meta["KeyId"] == custom_id
+    assert meta["Arn"].endswith(f":key/{custom_id}")
+    assert meta["KeySpec"] == "SYMMETRIC_DEFAULT"
+    assert meta["Enabled"] is True
+
+
+def test_kms_custom_id_rsa(kms_client):
+    custom_id = str(_uuid_mod.uuid4())
+    resp = kms_client.create_key(
+        KeySpec="RSA_2048",
+        KeyUsage="SIGN_VERIFY",
+        Tags=[{"TagKey": "_custom_id_", "TagValue": custom_id}],
+    )
+    meta = resp["KeyMetadata"]
+    assert meta["KeyId"] == custom_id
+    assert meta["Arn"].endswith(f":key/{custom_id}")
+    assert meta["KeySpec"] == "RSA_2048"
+
+
+def test_kms_custom_id_not_stored_as_tag(kms_client):
+    custom_id = str(_uuid_mod.uuid4())
+    resp = kms_client.create_key(
+        Tags=[
+            {"TagKey": "_custom_id_", "TagValue": custom_id},
+            {"TagKey": "env", "TagValue": "test"},
+        ]
+    )
+    key_id = resp["KeyMetadata"]["KeyId"]
+    tags = kms_client.list_resource_tags(KeyId=key_id)["Tags"]
+    tag_keys = {t["TagKey"] for t in tags}
+    assert "_custom_id_" not in tag_keys
+    assert "env" in tag_keys
+
+
+def test_kms_custom_material_not_stored_as_tag(kms_client):
+    material = os.urandom(32).hex()
+    resp = kms_client.create_key(
+        Tags=[
+            {"TagKey": "_custom_key_material_", "TagValue": material},
+            {"TagKey": "env", "TagValue": "test"},
+        ]
+    )
+    key_id = resp["KeyMetadata"]["KeyId"]
+    tags = kms_client.list_resource_tags(KeyId=key_id)["Tags"]
+    tag_keys = {t["TagKey"] for t in tags}
+    assert "_custom_key_material_" not in tag_keys
+    assert "env" in tag_keys
+
+
+def test_kms_custom_material_symmetric_encrypt_decrypt(kms_client):
+    custom_id = str(_uuid_mod.uuid4())
+    material_hex = "34743777217a25432a46294a404e635266556a586e3272357538782f413f4428"
+    resp = kms_client.create_key(
+        Tags=[
+            {"TagKey": "_custom_id_", "TagValue": custom_id},
+            {"TagKey": "_custom_key_material_", "TagValue": material_hex},
+        ]
+    )
+    assert resp["KeyMetadata"]["KeyId"] == custom_id
+
+    plaintext = b"hello custom material"
+    enc = kms_client.encrypt(KeyId=custom_id, Plaintext=plaintext)
+    dec = kms_client.decrypt(CiphertextBlob=enc["CiphertextBlob"])
+    assert dec["Plaintext"] == plaintext
+
+
+def test_kms_custom_material_symmetric_material_is_actually_used(kms_client):
+    # Two keys with identical material. Encrypting under key1 and decrypting
+    # with key2 (via explicit KeyId) must succeed because the XOR keystream
+    # depends only on the symmetric material + context + nonce, all of which
+    # are identical or present in the ciphertext.
+    material_hex = os.urandom(32).hex()
+    id1, id2 = str(_uuid_mod.uuid4()), str(_uuid_mod.uuid4())
+    for key_id in (id1, id2):
+        kms_client.create_key(
+            Tags=[
+                {"TagKey": "_custom_id_", "TagValue": key_id},
+                {"TagKey": "_custom_key_material_", "TagValue": material_hex},
+            ]
+        )
+
+    plaintext = b"cross-key material proof"
+    enc = kms_client.encrypt(KeyId=id1, Plaintext=plaintext)
+    dec = kms_client.decrypt(CiphertextBlob=enc["CiphertextBlob"], KeyId=id2)
+    assert dec["Plaintext"] == plaintext
+
+
+def test_kms_custom_id_duplicate_raises(kms_client):
+    custom_id = str(_uuid_mod.uuid4())
+    kms_client.create_key(Tags=[{"TagKey": "_custom_id_", "TagValue": custom_id}])
+    with pytest.raises(ClientError) as exc:
+        kms_client.create_key(Tags=[{"TagKey": "_custom_id_", "TagValue": custom_id}])
+    assert exc.value.response["Error"]["Code"] == "AlreadyExistsException"
+
+
+def test_kms_custom_material_symmetric_invalid_hex(kms_client):
+    with pytest.raises(ClientError) as exc:
+        kms_client.create_key(
+            Tags=[{"TagKey": "_custom_key_material_", "TagValue": "not-valid-hex"}]
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_custom_material_symmetric_wrong_length_short(kms_client):
+    # 4 bytes — must be exactly 32
+    with pytest.raises(ClientError) as exc:
+        kms_client.create_key(
+            Tags=[{"TagKey": "_custom_key_material_", "TagValue": "deadbeef"}]
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "32" in exc.value.response["Error"]["Message"]
+
+
+def test_kms_custom_material_symmetric_wrong_length_long(kms_client):
+    # 33 bytes — one byte too many
+    with pytest.raises(ClientError) as exc:
+        kms_client.create_key(
+            Tags=[{"TagKey": "_custom_key_material_", "TagValue": "aa" * 33}]
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_custom_material_rsa_invalid_base64(kms_client):
+    with pytest.raises(ClientError) as exc:
+        kms_client.create_key(
+            KeySpec="RSA_2048",
+            KeyUsage="SIGN_VERIFY",
+            Tags=[{"TagKey": "_custom_key_material_", "TagValue": "not!valid!base64!!!"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_custom_material_rsa_invalid_pem(kms_client):
+    garbage_b64 = base64.b64encode(b"this is not a pem").decode()
+    with pytest.raises(ClientError) as exc:
+        kms_client.create_key(
+            KeySpec="RSA_2048",
+            KeyUsage="SIGN_VERIFY",
+            Tags=[{"TagKey": "_custom_key_material_", "TagValue": garbage_b64}],
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_custom_material_rsa_sign_verify(kms_client):
+    custom_id = str(_uuid_mod.uuid4())
+    pem_b64 = base64.b64encode(_RSA_TEST_KEY_PEM.encode()).decode()
+    resp = kms_client.create_key(
+        KeySpec="RSA_2048",
+        KeyUsage="SIGN_VERIFY",
+        Tags=[
+            {"TagKey": "_custom_id_", "TagValue": custom_id},
+            {"TagKey": "_custom_key_material_", "TagValue": pem_b64},
+        ],
+    )
+    assert resp["KeyMetadata"]["KeyId"] == custom_id
+
+    message = b"test message for custom rsa key"
+    sign = kms_client.sign(
+        KeyId=custom_id,
+        Message=message,
+        MessageType="RAW",
+        SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
+    )
+    verify = kms_client.verify(
+        KeyId=custom_id,
+        Message=message,
+        MessageType="RAW",
+        Signature=sign["Signature"],
+        SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
+    )
+    assert verify["SignatureValid"] is True
+
+
+def test_kms_custom_material_rsa_public_key_matches_pem(kms_client):
+    # The public key reported by GetPublicKey must correspond to the private
+    # key supplied via _custom_key_material_, not to a freshly generated pair.
+    serialization = pytest.importorskip(
+        "cryptography.hazmat.primitives.serialization"
+    )
+    custom_id = str(_uuid_mod.uuid4())
+    pem_b64 = base64.b64encode(_RSA_TEST_KEY_PEM.encode()).decode()
+    kms_client.create_key(
+        KeySpec="RSA_2048",
+        KeyUsage="SIGN_VERIFY",
+        Tags=[
+            {"TagKey": "_custom_id_", "TagValue": custom_id},
+            {"TagKey": "_custom_key_material_", "TagValue": pem_b64},
+        ],
+    )
+
+    pub_resp = kms_client.get_public_key(KeyId=custom_id)
+    returned_pub_der = pub_resp["PublicKey"]
+
+    private_key = serialization.load_pem_private_key(
+        _RSA_TEST_KEY_PEM.encode(), password=None
+    )
+    expected_pub_der = private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    assert returned_pub_der == expected_pub_der
+
+
+def test_kms_custom_id_only_no_material_tag(kms_client):
+    # _custom_id_ without _custom_key_material_: server generates random material.
+    # The key must work normally — encrypt/decrypt roundtrip succeeds.
+    custom_id = str(_uuid_mod.uuid4())
+    kms_client.create_key(
+        Tags=[{"TagKey": "_custom_id_", "TagValue": custom_id}]
+    )
+    enc = kms_client.encrypt(KeyId=custom_id, Plaintext=b"random material test")
+    dec = kms_client.decrypt(CiphertextBlob=enc["CiphertextBlob"])
+    assert dec["Plaintext"] == b"random material test"
+
+
+def test_kms_custom_material_only_id_is_generated(kms_client):
+    # _custom_key_material_ without _custom_id_: server generates a UUID.
+    material_hex = os.urandom(32).hex()
+    resp = kms_client.create_key(
+        Tags=[{"TagKey": "_custom_key_material_", "TagValue": material_hex}]
+    )
+    meta = resp["KeyMetadata"]
+    # A generated UUID is 36 chars and contains hyphens.
+    assert len(meta["KeyId"]) == 36
+    assert meta["KeyId"].count("-") == 4
+
+    enc = kms_client.encrypt(KeyId=meta["KeyId"], Plaintext=b"material only test")
+    dec = kms_client.decrypt(CiphertextBlob=enc["CiphertextBlob"])
+    assert dec["Plaintext"] == b"material only test"
+
+
+def test_kms_custom_id_and_material_hmac(kms_client):
+    custom_id = str(_uuid_mod.uuid4())
+    material_hex = os.urandom(32).hex()
+    resp = kms_client.create_key(
+        KeySpec="HMAC_256",
+        KeyUsage="GENERATE_VERIFY_MAC",
+        Tags=[
+            {"TagKey": "_custom_id_", "TagValue": custom_id},
+            {"TagKey": "_custom_key_material_", "TagValue": material_hex},
+        ],
+    )
+    assert resp["KeyMetadata"]["KeyId"] == custom_id
+
+    msg = b"hmac determinism check"
+    mac1 = kms_client.generate_mac(
+        KeyId=custom_id, Message=msg, MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    mac2 = kms_client.generate_mac(
+        KeyId=custom_id, Message=msg, MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    assert mac1 == mac2
+
+
+def test_kms_custom_material_hmac_known_value(kms_client):
+    import hmac as _hmac_mod
+    import hashlib
+
+    key_bytes = os.urandom(32)
+    material_hex = key_bytes.hex()
+    custom_id = str(_uuid_mod.uuid4())
+
+    kms_client.create_key(
+        KeySpec="HMAC_256",
+        KeyUsage="GENERATE_VERIFY_MAC",
+        Tags=[
+            {"TagKey": "_custom_id_", "TagValue": custom_id},
+            {"TagKey": "_custom_key_material_", "TagValue": material_hex},
+        ],
+    )
+
+    message = b"known value verification"
+    expected_mac = _hmac_mod.new(key_bytes, message, hashlib.sha256).digest()
+
+    actual_mac = kms_client.generate_mac(
+        KeyId=custom_id, Message=message, MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    assert actual_mac == expected_mac
+
+
+def test_kms_custom_material_hmac_wrong_length(kms_client):
+    # HMAC_256 needs exactly 32 bytes; 4 bytes must be rejected.
+    with pytest.raises(ClientError) as exc:
+        kms_client.create_key(
+            KeySpec="HMAC_256",
+            KeyUsage="GENERATE_VERIFY_MAC",
+            Tags=[{"TagKey": "_custom_key_material_", "TagValue": "deadbeef"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert "32" in exc.value.response["Error"]["Message"]
+
+
+def test_kms_custom_material_hmac_invalid_hex(kms_client):
+    with pytest.raises(ClientError) as exc:
+        kms_client.create_key(
+            KeySpec="HMAC_256",
+            KeyUsage="GENERATE_VERIFY_MAC",
+            Tags=[{"TagKey": "_custom_key_material_", "TagValue": "not-hex"}],
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_custom_id_describe_key(kms_client):
+    custom_id = str(_uuid_mod.uuid4())
+    kms_client.create_key(
+        Description="custom id key",
+        Tags=[{"TagKey": "_custom_id_", "TagValue": custom_id}],
+    )
+    desc = kms_client.describe_key(KeyId=custom_id)["KeyMetadata"]
+    assert desc["KeyId"] == custom_id
+    assert desc["Description"] == "custom id key"
+    assert desc["KeyState"] == "Enabled"
+
+
+def test_kms_custom_id_resolve_by_alias(kms_client):
+    custom_id = str(_uuid_mod.uuid4())
+    kms_client.create_key(
+        Tags=[{"TagKey": "_custom_id_", "TagValue": custom_id}]
+    )
+    alias = f"alias/custom-{_uuid_mod.uuid4().hex[:8]}"
+    kms_client.create_alias(AliasName=alias, TargetKeyId=custom_id)
+
+    desc = kms_client.describe_key(KeyId=alias)["KeyMetadata"]
+    assert desc["KeyId"] == custom_id
+
+
+def test_kms_custom_id_appears_in_list_keys(kms_client):
+    custom_id = str(_uuid_mod.uuid4())
+    kms_client.create_key(
+        Tags=[{"TagKey": "_custom_id_", "TagValue": custom_id}]
+    )
+    all_ids = {k["KeyId"] for k in kms_client.list_keys()["Keys"]}
+    assert custom_id in all_ids
