@@ -109,7 +109,7 @@ def get_state():
     for scoped_key, rec in _keys._data.items():
         entry = {k: v for k, v in rec.items()
                  if k not in ("_private_key", "_public_key_der", "_symmetric_key",
-                              "_hmac_key")}
+                              "_hmac_key", "_import_wrapping_private_key")}
         if "_symmetric_key" in rec:
             entry["_symmetric_key_b64"] = base64.b64encode(rec["_symmetric_key"]).decode()
         if "_hmac_key" in rec:
@@ -124,6 +124,16 @@ def get_state():
                     serialization.NoEncryption(),
                 )
                 entry["_private_key_pem"] = base64.b64encode(pem).decode()
+            except Exception:
+                pass
+        if "_import_wrapping_private_key" in rec and HAS_CRYPTO:
+            try:
+                pem = rec["_import_wrapping_private_key"].private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.PKCS8,
+                    serialization.NoEncryption(),
+                )
+                entry["_import_wrapping_private_key_pem"] = base64.b64encode(pem).decode()
             except Exception:
                 pass
         serializable_keys._data[scoped_key] = entry
@@ -158,6 +168,12 @@ def _restore_state(data):
                 try:
                     pem_bytes = base64.b64decode(entry.pop("_private_key_pem"))
                     entry["_private_key"] = serialization.load_pem_private_key(pem_bytes, password=None)
+                except Exception:
+                    pass
+            if "_import_wrapping_private_key_pem" in entry and HAS_CRYPTO:
+                try:
+                    pem_bytes = base64.b64decode(entry.pop("_import_wrapping_private_key_pem"))
+                    entry["_import_wrapping_private_key"] = serialization.load_pem_private_key(pem_bytes, password=None)
                 except Exception:
                     pass
 
@@ -252,6 +268,10 @@ def _key_metadata(rec):
         }
         if rec.get("KeyState") == "PendingReplicaDeletion" and rec.get("_pending_window_days"):
             metadata["PendingDeletionWindowInDays"] = rec["_pending_window_days"]
+    if "ExpirationModel" in rec:
+        metadata["ExpirationModel"] = rec["ExpirationModel"]
+    if "ValidTo" in rec:
+        metadata["ValidTo"] = rec["ValidTo"]
     return metadata
 
 
@@ -312,6 +332,12 @@ def _check_key_state(rec):
             f"{rec['Arn']} is disabled.",
             400,
         )
+    if rec["KeyState"] == "PendingImport":
+        return error_response_json(
+            "KMSInvalidStateException",
+            f"{rec['Arn']} is pending import.",
+            400,
+        )
     return None
 
 
@@ -351,6 +377,13 @@ def _create_key(data):
     key_id = f"mrk-{new_uuid().replace('-', '')}" if multi_region else new_uuid()
     key_spec = data.get("KeySpec", data.get("CustomerMasterKeySpec", "SYMMETRIC_DEFAULT"))
     key_usage = data.get("KeyUsage", "ENCRYPT_DECRYPT")
+    origin = data.get("Origin", "AWS_KMS")
+    if origin not in ("AWS_KMS", "EXTERNAL"):
+        return error_response_json(
+            "ValidationException",
+            f"Origin '{origin}' is not valid. Valid values are AWS_KMS, EXTERNAL.",
+            400,
+        )
     if key_spec in _HMAC_KEY_SPECS and key_usage != MAC_KEY_USAGE:
         return error_response_json(
             "ValidationException",
@@ -389,7 +422,7 @@ def _create_key(data):
         "KeyUsage": key_usage,
         "Description": description,
         "CreationDate": int(time.time()),
-        "Origin": "AWS_KMS",
+        "Origin": origin,
         "Tags": tags,
         "Policy": policy,
         "MultiRegion": multi_region,
@@ -402,6 +435,46 @@ def _create_key(data):
         rec["_mrk_type"] = "PRIMARY"
         rec["_mrk_primary_region"] = get_region()
         rec["_mrk_regions"] = [get_region()]
+
+    if origin == "EXTERNAL":
+        rec["KeyState"] = "PendingImport"
+        rec["Enabled"] = False
+        if key_spec == "SYMMETRIC_DEFAULT":
+            rec["EncryptionAlgorithms"] = ["SYMMETRIC_DEFAULT"]
+            rec["SigningAlgorithms"] = []
+        elif key_spec in _HMAC_KEY_SPECS:
+            mac_algorithm, _ = _HMAC_KEY_SPECS[key_spec]
+            rec["MacAlgorithms"] = [mac_algorithm]
+        elif key_spec in ("RSA_2048", "RSA_3072", "RSA_4096"):
+            if key_usage == "SIGN_VERIFY":
+                rec["SigningAlgorithms"] = [
+                    "RSASSA_PKCS1_V1_5_SHA_256", "RSASSA_PKCS1_V1_5_SHA_384",
+                    "RSASSA_PKCS1_V1_5_SHA_512", "RSASSA_PSS_SHA_256",
+                    "RSASSA_PSS_SHA_384", "RSASSA_PSS_SHA_512",
+                ]
+                rec["EncryptionAlgorithms"] = []
+            else:
+                rec["EncryptionAlgorithms"] = ["RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256"]
+                rec["SigningAlgorithms"] = []
+        elif key_spec in ("ECC_NIST_P256", "ECC_NIST_P384", "ECC_NIST_P521", "ECC_SECG_P256K1"):
+            signing_algo_map = {
+                "ECC_NIST_P256": ["ECDSA_SHA_256"], "ECC_NIST_P384": ["ECDSA_SHA_384"],
+                "ECC_NIST_P521": ["ECDSA_SHA_512"], "ECC_SECG_P256K1": ["ECDSA_SHA_256"],
+            }
+            rec["SigningAlgorithms"] = signing_algo_map[key_spec]
+            rec["EncryptionAlgorithms"] = []
+        elif key_spec == "ECC_NIST_EDWARDS25519":
+            rec["SigningAlgorithms"] = ["ED25519_SHA_512", "ED25519_PH_SHA_512"]
+            rec["EncryptionAlgorithms"] = []
+        else:
+            return error_response_json(
+                "UnsupportedOperationException",
+                f"KeySpec {key_spec} is not supported in this emulator",
+                400,
+            )
+        _keys[key_id] = rec
+        logger.info("Created key %s (%s, %s, PendingImport)", key_id, key_spec, key_usage)
+        return json_response({"KeyMetadata": _key_metadata(rec)})
 
     if key_spec == "SYMMETRIC_DEFAULT":
         rec["_symmetric_key"] = os.urandom(32)
@@ -1450,6 +1523,12 @@ def _enable_key(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
         return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+    if rec.get("KeyState") == "PendingImport":
+        return error_response_json(
+            "KMSInvalidStateException",
+            f"{rec['Arn']} is pending import.",
+            400,
+        )
     rec["Enabled"] = True
     rec["KeyState"] = "Enabled"
     return json_response({})
@@ -1703,6 +1782,367 @@ def _generate_random(data):
     return json_response({"Plaintext": base64.b64encode(os.urandom(number_of_bytes)).decode()})
 
 
+# ---- Key import (BYOK with Origin=EXTERNAL) ----
+
+def _wrapping_padding(algorithm):
+    if algorithm == "RSAES_PKCS1_V1_5":
+        return padding.PKCS1v15()
+    elif algorithm == "RSAES_OAEP_SHA_1":
+        return padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA1()),
+            algorithm=hashes.SHA1(),
+            label=None,
+        )
+    else:
+        return padding.OAEP(
+            mgf=padding.MGF1(algorithm=hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        )
+
+
+_VALID_WRAPPING_ALGOS = frozenset({
+    "RSAES_PKCS1_V1_5", "RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256",
+    "RSA_AES_KEY_WRAP_SHA_1", "RSA_AES_KEY_WRAP_SHA_256",
+})
+_VALID_WRAPPING_KEY_SPECS = frozenset({"RSA_2048", "RSA_3072", "RSA_4096"})
+
+
+def _get_parameters_for_import(data):
+    key_id_or_arn = data.get("KeyId", "")
+    rec = _resolve_key(key_id_or_arn)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id_or_arn} not found", 400)
+    if rec.get("Origin") != "EXTERNAL":
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"{rec['Arn']} origin is {rec.get('Origin', 'AWS_KMS')}, not EXTERNAL.",
+            400,
+        )
+    if rec.get("KeyState") not in ("PendingImport", "Enabled"):
+        return error_response_json(
+            "KMSInvalidStateException",
+            f"{rec['Arn']} is in the {rec.get('KeyState')} state.",
+            400,
+        )
+    wrapping_algorithm = data.get("WrappingAlgorithm", "")
+    if wrapping_algorithm not in _VALID_WRAPPING_ALGOS:
+        return error_response_json(
+            "ValidationException",
+            f"The wrapping algorithm '{wrapping_algorithm}' is invalid.",
+            400,
+        )
+    wrapping_key_spec = data.get("WrappingKeySpec", "")
+    if wrapping_key_spec not in _VALID_WRAPPING_KEY_SPECS:
+        return error_response_json(
+            "ValidationException",
+            f"The wrapping key spec '{wrapping_key_spec}' is invalid.",
+            400,
+        )
+    err = _require_crypto("GetParametersForImport")
+    if err:
+        return err
+    key_size = int(wrapping_key_spec.split("_")[1])
+    wrapping_private_key = rsa.generate_private_key(public_exponent=65537, key_size=key_size)
+    public_key_der = wrapping_private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    expiry = int(time.time()) + 86400
+    rec["_import_wrapping_private_key"] = wrapping_private_key
+    rec["_import_token_exp"] = expiry
+    rec["_import_wrapping_algorithm"] = wrapping_algorithm
+    token_payload = json.dumps({"key_id": rec["KeyId"], "exp": expiry}).encode()
+    import_token = base64.b64encode(token_payload).decode()
+    return json_response({
+        "KeyId": rec["Arn"],
+        "ImportToken": import_token,
+        "PublicKey": base64.b64encode(public_key_der).decode(),
+        "ParametersValidTo": expiry,
+    })
+
+
+def _import_key_material(data):
+    key_id_or_arn = data.get("KeyId", "")
+    rec = _resolve_key(key_id_or_arn)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id_or_arn} not found", 400)
+    if rec.get("Origin") != "EXTERNAL":
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"{rec['Arn']} origin is {rec.get('Origin', 'AWS_KMS')}, not EXTERNAL.",
+            400,
+        )
+    if rec.get("KeyState") not in ("PendingImport", "Enabled"):
+        return error_response_json(
+            "KMSInvalidStateException",
+            f"{rec['Arn']} is in the {rec.get('KeyState')} state.",
+            400,
+        )
+    import_token_b64 = data.get("ImportToken", "")
+    encrypted_material_b64 = data.get("EncryptedKeyMaterial", "")
+    if not import_token_b64 or not encrypted_material_b64:
+        return error_response_json(
+            "ValidationException",
+            "ImportToken and EncryptedKeyMaterial are required.",
+            400,
+        )
+    try:
+        token_payload = json.loads(base64.b64decode(import_token_b64))
+    except Exception:
+        return error_response_json(
+            "InvalidImportTokenException",
+            "The import token is invalid.",
+            400,
+        )
+    if token_payload.get("key_id") != rec["KeyId"]:
+        return error_response_json(
+            "InvalidImportTokenException",
+            "The import token does not match the key ID.",
+            400,
+        )
+    if token_payload.get("exp", 0) < time.time():
+        return error_response_json(
+            "ExpiredImportTokenException",
+            "The import token has expired.",
+            400,
+        )
+    wrapping_private_key = rec.get("_import_wrapping_private_key")
+    if not wrapping_private_key:
+        return error_response_json(
+            "InvalidImportTokenException",
+            "No import parameters found for this key. Call GetParametersForImport first.",
+            400,
+        )
+    err = _require_crypto("ImportKeyMaterial")
+    if err:
+        return err
+    try:
+        encrypted_material = base64.b64decode(encrypted_material_b64)
+    except Exception:
+        return error_response_json(
+            "ValidationException",
+            "EncryptedKeyMaterial is not valid base64.",
+            400,
+        )
+    wrapping_algorithm = rec.get("_import_wrapping_algorithm", "RSAES_OAEP_SHA_256")
+    if wrapping_algorithm in ("RSA_AES_KEY_WRAP_SHA_1", "RSA_AES_KEY_WRAP_SHA_256"):
+        try:
+            from cryptography.hazmat.primitives.keywrap import aes_key_unwrap_with_padding
+            rsa_size_bytes = wrapping_private_key.key_size // 8
+            if len(encrypted_material) <= rsa_size_bytes:
+                return error_response_json(
+                    "InvalidCiphertextException",
+                    "EncryptedKeyMaterial is too short for RSA_AES_KEY_WRAP.",
+                    400,
+                )
+            oaep_hash = hashes.SHA1() if wrapping_algorithm == "RSA_AES_KEY_WRAP_SHA_1" else hashes.SHA256()
+            oaep_pad = padding.OAEP(
+                mgf=padding.MGF1(algorithm=oaep_hash),
+                algorithm=oaep_hash,
+                label=None,
+            )
+            aes_key = wrapping_private_key.decrypt(encrypted_material[:rsa_size_bytes], oaep_pad)
+            key_material = aes_key_unwrap_with_padding(aes_key, encrypted_material[rsa_size_bytes:])
+        except Exception as e:
+            return error_response_json(
+                "InvalidCiphertextException",
+                f"Failed to unwrap key material: {e}",
+                400,
+            )
+    else:
+        pad = _wrapping_padding(wrapping_algorithm)
+        try:
+            key_material = wrapping_private_key.decrypt(encrypted_material, pad)
+        except Exception as e:
+            return error_response_json(
+                "InvalidCiphertextException",
+                f"Failed to unwrap key material: {e}",
+                400,
+            )
+    key_spec = rec.get("KeySpec", "SYMMETRIC_DEFAULT")
+    if key_spec == "SYMMETRIC_DEFAULT":
+        if len(key_material) != 32:
+            return error_response_json(
+                "ValidationException",
+                f"Key material for SYMMETRIC_DEFAULT must be 32 bytes, got {len(key_material)}.",
+                400,
+            )
+        rec["_symmetric_key"] = key_material
+        rec["EncryptionAlgorithms"] = ["SYMMETRIC_DEFAULT"]
+        rec["SigningAlgorithms"] = []
+    elif key_spec in _HMAC_KEY_SPECS:
+        mac_algorithm, expected_len = _HMAC_KEY_SPECS[key_spec]
+        if len(key_material) != expected_len:
+            return error_response_json(
+                "ValidationException",
+                f"Key material for {key_spec} must be {expected_len} bytes, got {len(key_material)}.",
+                400,
+            )
+        rec["_hmac_key"] = key_material
+        rec["MacAlgorithms"] = [mac_algorithm]
+    elif key_spec in ("RSA_2048", "RSA_3072", "RSA_4096"):
+        err = _require_crypto("ImportKeyMaterial")
+        if err:
+            return err
+        try:
+            private_key = serialization.load_der_private_key(key_material, password=None)
+        except Exception as e:
+            return error_response_json(
+                "InvalidKeyUsageException",
+                f"Key material is not a valid DER-encoded PKCS#8 private key: {e}",
+                400,
+            )
+        if not isinstance(private_key, rsa.RSAPrivateKey):
+            return error_response_json(
+                "InvalidKeyUsageException",
+                f"Key material for {key_spec} must be an RSA private key.",
+                400,
+            )
+        expected_bits = int(key_spec.split("_")[1])
+        if private_key.key_size != expected_bits:
+            return error_response_json(
+                "InvalidKeyUsageException",
+                f"Key material for {key_spec} must be {expected_bits}-bit RSA, got {private_key.key_size}-bit.",
+                400,
+            )
+        rec["_private_key"] = private_key
+        rec["_public_key_der"] = private_key.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        key_usage = rec.get("KeyUsage", "SIGN_VERIFY")
+        if key_usage == "SIGN_VERIFY":
+            rec["SigningAlgorithms"] = [
+                "RSASSA_PKCS1_V1_5_SHA_256", "RSASSA_PKCS1_V1_5_SHA_384",
+                "RSASSA_PKCS1_V1_5_SHA_512", "RSASSA_PSS_SHA_256",
+                "RSASSA_PSS_SHA_384", "RSASSA_PSS_SHA_512",
+            ]
+            rec["EncryptionAlgorithms"] = []
+        else:
+            rec["EncryptionAlgorithms"] = ["RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256"]
+            rec["SigningAlgorithms"] = []
+    elif key_spec in ("ECC_NIST_P256", "ECC_NIST_P384", "ECC_NIST_P521", "ECC_SECG_P256K1"):
+        err = _require_crypto("ImportKeyMaterial")
+        if err:
+            return err
+        try:
+            private_key = serialization.load_der_private_key(key_material, password=None)
+        except Exception as e:
+            return error_response_json(
+                "InvalidKeyUsageException",
+                f"Key material is not a valid DER-encoded PKCS#8 private key: {e}",
+                400,
+            )
+        if not isinstance(private_key, ec.EllipticCurvePrivateKey):
+            return error_response_json(
+                "InvalidKeyUsageException",
+                f"Key material for {key_spec} must be an ECC private key.",
+                400,
+            )
+        curve_map = {
+            "ECC_NIST_P256": ec.SECP256R1, "ECC_NIST_P384": ec.SECP384R1,
+            "ECC_NIST_P521": ec.SECP521R1, "ECC_SECG_P256K1": ec.SECP256K1,
+        }
+        if not isinstance(private_key.curve, curve_map[key_spec]):
+            return error_response_json(
+                "InvalidKeyUsageException",
+                f"Key material curve does not match key spec {key_spec}.",
+                400,
+            )
+        rec["_private_key"] = private_key
+        rec["_public_key_der"] = private_key.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        signing_algo_map = {
+            "ECC_NIST_P256": ["ECDSA_SHA_256"], "ECC_NIST_P384": ["ECDSA_SHA_384"],
+            "ECC_NIST_P521": ["ECDSA_SHA_512"], "ECC_SECG_P256K1": ["ECDSA_SHA_256"],
+        }
+        rec["SigningAlgorithms"] = signing_algo_map[key_spec]
+        rec["EncryptionAlgorithms"] = []
+    elif key_spec == "ECC_NIST_EDWARDS25519":
+        err = _require_crypto("ImportKeyMaterial")
+        if err:
+            return err
+        try:
+            private_key = serialization.load_der_private_key(key_material, password=None)
+        except Exception as e:
+            return error_response_json(
+                "InvalidKeyUsageException",
+                f"Key material is not a valid DER-encoded PKCS#8 private key: {e}",
+                400,
+            )
+        if not isinstance(private_key, ed25519.Ed25519PrivateKey):
+            return error_response_json(
+                "InvalidKeyUsageException",
+                f"Key material for {key_spec} must be an Ed25519 private key.",
+                400,
+            )
+        rec["_private_key"] = private_key
+        rec["_public_key_der"] = private_key.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        rec["SigningAlgorithms"] = ["ED25519_SHA_512", "ED25519_PH_SHA_512"]
+        rec["EncryptionAlgorithms"] = []
+    else:
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"ImportKeyMaterial is not supported for key spec {key_spec}.",
+            400,
+        )
+    expiration_model = data.get("ExpirationModel", "KEY_MATERIAL_DOES_NOT_EXPIRE")
+    if expiration_model == "KEY_MATERIAL_EXPIRES":
+        valid_to = data.get("ValidTo")
+        if not valid_to:
+            return error_response_json(
+                "ValidationException",
+                "ValidTo is required when ExpirationModel is KEY_MATERIAL_EXPIRES.",
+                400,
+            )
+        rec["ValidTo"] = valid_to
+    else:
+        rec.pop("ValidTo", None)
+    rec["ExpirationModel"] = expiration_model
+    rec["KeyState"] = "Enabled"
+    rec["Enabled"] = True
+    rec.pop("_import_wrapping_private_key", None)
+    rec.pop("_import_token_exp", None)
+    rec.pop("_import_wrapping_algorithm", None)
+    logger.info("Imported key material for %s (%s)", rec["KeyId"], key_spec)
+    return json_response({})
+
+
+def _delete_imported_key_material(data):
+    key_id_or_arn = data.get("KeyId", "")
+    rec = _resolve_key(key_id_or_arn)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id_or_arn} not found", 400)
+    if rec.get("Origin") != "EXTERNAL":
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"{rec['Arn']} origin is {rec.get('Origin', 'AWS_KMS')}, not EXTERNAL.",
+            400,
+        )
+    if rec.get("KeyState") == "PendingDeletion":
+        return error_response_json(
+            "KMSInvalidStateException",
+            f"{rec['Arn']} is pending deletion.",
+            400,
+        )
+    rec.pop("_symmetric_key", None)
+    rec.pop("_hmac_key", None)
+    rec.pop("_private_key", None)
+    rec.pop("_public_key_der", None)
+    rec.pop("ExpirationModel", None)
+    rec.pop("ValidTo", None)
+    rec.pop("EncryptionAlgorithms", None)
+    rec.pop("SigningAlgorithms", None)
+    rec.pop("MacAlgorithms", None)
+    rec["KeyState"] = "PendingImport"
+    rec["Enabled"] = False
+    logger.info("Deleted imported key material for %s", rec["KeyId"])
+    return json_response({})
+
+
 # ---- Request handler ----
 
 async def handle_request(method, path, headers, body, query_params):
@@ -1749,6 +2189,9 @@ async def handle_request(method, path, headers, body, query_params):
         "TagResource": _tag_resource,
         "UntagResource": _untag_resource,
         "ListResourceTags": _list_resource_tags,
+        "GetParametersForImport": _get_parameters_for_import,
+        "ImportKeyMaterial": _import_key_material,
+        "DeleteImportedKeyMaterial": _delete_imported_key_material,
     }
 
     handler = handlers.get(action)
